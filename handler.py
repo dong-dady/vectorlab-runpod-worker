@@ -25,7 +25,7 @@ async def process_queued_job(input: dict) -> dict:
     max_image_pixels = 25_000_000
     max_generation_attempts = 3
     valid_modes = {"balanced", "high_detail"}
-    starvector_max_length = 4000
+    starvector_max_length = 8192
     model_id = os.getenv("STARVECTOR_MODEL_ID", "starvector/starvector-1b-im2svg")
     model_revision = os.getenv(
         "STARVECTOR_MODEL_REVISION",
