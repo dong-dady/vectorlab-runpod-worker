@@ -23,9 +23,10 @@ async def process_queued_job(input: dict) -> dict:
     max_input_bytes = 10 * 1024 * 1024
     max_output_bytes = 25 * 1024 * 1024
     max_image_pixels = 25_000_000
-    max_generation_attempts = 3
+    max_generation_attempts = 2
     valid_modes = {"balanced", "high_detail"}
-    starvector_max_length = 8192
+    starvector_max_new_tokens = 7800
+    starvector_context_safety_tokens = 16
     model_id = os.getenv("STARVECTOR_MODEL_ID", "starvector/starvector-1b-im2svg")
     model_revision = os.getenv(
         "STARVECTOR_MODEL_REVISION",
@@ -128,6 +129,7 @@ async def process_queued_job(input: dict) -> dict:
             "<iframe",
             "<object",
             "<embed",
+            "<image",
             "javascript:",
             "data:text/html",
         )
@@ -143,8 +145,21 @@ async def process_queued_job(input: dict) -> dict:
 
         path_count = 0
         point_count = 0
+        drawable_count = 0
+        drawable_tags = {
+            "circle",
+            "ellipse",
+            "line",
+            "path",
+            "polygon",
+            "polyline",
+            "rect",
+            "text",
+        }
         for element in root.iter():
             tag = element.tag.split("}")[-1].lower()
+            if tag in drawable_tags:
+                drawable_count += 1
             for attribute, value in element.attrib.items():
                 name = attribute.split("}")[-1].lower()
                 compact = value.strip().lower()
@@ -158,6 +173,9 @@ async def process_queued_job(input: dict) -> dict:
                 path_count += 1
                 numbers = re.findall(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?", element.attrib.get("d", ""))
                 point_count += math.ceil(len(numbers) / 2)
+
+        if drawable_count == 0:
+            raise ValueError("svg_empty")
 
         return {
             "svg": raw_svg,
@@ -176,8 +194,18 @@ async def process_queued_job(input: dict) -> dict:
         return validate_svg(raw_svg)
 
     def convert_starvector(payload: bytes, image, mode: str) -> dict:
-        from starvector.data.util import process_and_rasterize_svg
-        from transformers import AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM, StoppingCriteria, StoppingCriteriaList
+
+        class StopOnSequence(StoppingCriteria):
+            def __init__(self, stop_ids):
+                self.stop_ids = torch.tensor(stop_ids, dtype=torch.long)
+
+            def __call__(self, input_ids, scores, **kwargs):
+                if input_ids.shape[1] < self.stop_ids.numel():
+                    return False
+                stop_ids = self.stop_ids.to(input_ids.device)
+                matches = input_ids[:, -stop_ids.numel():] == stop_ids
+                return bool(matches.all(dim=1).all().item())
 
         global _VECTORLAB_STARVECTOR_MODEL
         try:
@@ -205,29 +233,141 @@ async def process_queued_job(input: dict) -> dict:
             "big",
         )
 
-        svg = "<svg></svg>"
+        core = model.model
+        tokenizer = core.svg_transformer.tokenizer
+        transformer = core.svg_transformer.transformer
+        inputs_embeds, attention_mask, prompt_tokens = core._prepare_generation_inputs(
+            {"image": pixel_values},
+            None,
+            pixel_values.device,
+        )
+        context_limit = int(
+            getattr(
+                transformer.config,
+                "max_position_embeddings",
+                getattr(model.config, "max_position_embeddings", 8192),
+            )
+        )
+        prefix_tokens = int(inputs_embeds.shape[1])
+        hard_budget = context_limit - prefix_tokens - starvector_context_safety_tokens
+        max_new_tokens = min(starvector_max_new_tokens, hard_budget)
+        if max_new_tokens < 256:
+            raise RuntimeError("generation_context_exhausted")
+
+        close_text = "</svg>"
+        close_ids = tokenizer(close_text, add_special_tokens=False)["input_ids"]
+        stopping_criteria = StoppingCriteriaList([StopOnSequence(close_ids)])
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        generation_profiles = (
+            {
+                "name": "sampled_low_temperature",
+                "do_sample": True,
+                "temperature": 0.2,
+                "top_p": 0.95,
+            },
+            {
+                "name": "greedy",
+                "do_sample": False,
+            },
+        )
+
+        last_failure = "generation_failed"
         with torch.inference_mode():
-            for attempt in range(max_generation_attempts):
+            for attempt, profile in enumerate(generation_profiles[:max_generation_attempts]):
                 seed = base_seed + attempt
                 torch.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
-                raw_svg = model.generate_im2svg(
-                    {"image": pixel_values},
-                    max_length=starvector_max_length,
-                )[0]
-                svg, _ = process_and_rasterize_svg(raw_svg)
+                torch.cuda.reset_peak_memory_stats()
+                attempt_started_at = time.perf_counter()
+                generation_kwargs = {
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask,
+                    "do_sample": profile["do_sample"],
+                    "num_beams": 1,
+                    "max_new_tokens": max_new_tokens,
+                    "repetition_penalty": 1.0,
+                    "use_cache": True,
+                    "stopping_criteria": stopping_criteria,
+                    "pad_token_id": pad_token_id,
+                    "eos_token_id": tokenizer.eos_token_id,
+                    "return_dict_in_generate": True,
+                    "output_scores": False,
+                }
+                if profile["do_sample"]:
+                    generation_kwargs.update(
+                        temperature=profile["temperature"],
+                        top_p=profile["top_p"],
+                    )
+
+                outputs = transformer.generate(**generation_kwargs)
+                generated_tokens = outputs.sequences[0]
+                decoded_tokens = torch.cat(
+                    [prompt_tokens.input_ids[0], generated_tokens],
+                    dim=0,
+                )
+                raw_svg = tokenizer.decode(decoded_tokens, skip_special_tokens=True)
+                lowered = raw_svg.lower()
+                svg_start = lowered.find("<svg")
+                svg_end = lowered.find(close_text, svg_start)
+                has_svg_close = svg_start >= 0 and svg_end >= 0
+                token_count = int(generated_tokens.numel())
+                eos_seen = (
+                    tokenizer.eos_token_id is not None
+                    and bool((generated_tokens == tokenizer.eos_token_id).any().item())
+                )
+                stop_reason = (
+                    "svg_close"
+                    if has_svg_close
+                    else "eos"
+                    if eos_seen
+                    else "token_limit"
+                    if token_count >= max_new_tokens
+                    else "unknown"
+                )
+                attempt_ms = round((time.perf_counter() - attempt_started_at) * 1000)
+                peak_vram_mb = round(torch.cuda.max_memory_allocated() / 1024 / 1024, 1)
                 print(
                     "starvector_generation "
                     f"attempt={attempt + 1} "
-                    f"raw_chars={len(raw_svg) if isinstance(raw_svg, str) else -1} "
-                    f"has_svg_close={isinstance(raw_svg, str) and '</svg>' in raw_svg.lower()} "
-                    f"postprocessed_empty={svg.strip() in {'<svg></svg>', '<svg/>', '<svg />'}}"
+                    f"profile={profile['name']} "
+                    f"prefix_tokens={prefix_tokens} "
+                    f"max_new_tokens={max_new_tokens} "
+                    f"generated_tokens={token_count} "
+                    f"raw_chars={len(raw_svg)} "
+                    f"has_svg_close={has_svg_close} "
+                    f"stop_reason={stop_reason} "
+                    f"elapsed_ms={attempt_ms} "
+                    f"peak_vram_mb={peak_vram_mb}"
                 )
-                if svg.strip() not in {"<svg></svg>", "<svg/>", "<svg />"}:
-                    break
-        if svg.strip() in {"<svg></svg>", "<svg/>", "<svg />"}:
-            raise ValueError("generation_failed")
-        return validate_svg(svg)
+                if not has_svg_close:
+                    last_failure = (
+                        "generation_truncated"
+                        if stop_reason == "token_limit"
+                        else "generation_incomplete"
+                    )
+                    continue
+
+                svg = raw_svg[svg_start : svg_end + len(close_text)].strip()
+                try:
+                    converted = validate_svg(svg)
+                except ValueError as error:
+                    last_failure = str(error)
+                    continue
+                converted["metrics"].update(
+                    {
+                        "generationProfile": profile["name"],
+                        "generationTokenCount": token_count,
+                        "generationStopReason": stop_reason,
+                        "prefixTokenCount": prefix_tokens,
+                        "maxNewTokens": max_new_tokens,
+                        "peakVramMb": peak_vram_mb,
+                    }
+                )
+                return converted
+
+        raise ValueError(last_failure)
 
     def safe_error_code(error: Exception) -> str:
         known = {
@@ -238,7 +378,11 @@ async def process_queued_job(input: dict) -> dict:
             "svg_size_limit",
             "svg_invalid_root",
             "svg_unsafe_content",
+            "svg_empty",
             "generation_failed",
+            "generation_incomplete",
+            "generation_truncated",
+            "generation_context_exhausted",
             "input_download_failed",
             "output_upload_failed",
             "job_completion_failed",
