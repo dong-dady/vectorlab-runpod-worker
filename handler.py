@@ -24,7 +24,8 @@ async def process_queued_job(input: dict) -> dict:
     max_output_bytes = 25 * 1024 * 1024
     max_image_pixels = 25_000_000
     max_generation_attempts = 3
-    max_length_by_mode = {"balanced": 2500, "high_detail": 4000}
+    valid_modes = {"balanced", "high_detail"}
+    starvector_max_length = 4000
     model_id = os.getenv("STARVECTOR_MODEL_ID", "starvector/starvector-1b-im2svg")
     model_revision = os.getenv(
         "STARVECTOR_MODEL_REVISION",
@@ -212,14 +213,16 @@ async def process_queued_job(input: dict) -> dict:
                 torch.cuda.manual_seed_all(seed)
                 raw_svg = model.generate_im2svg(
                     {"image": pixel_values},
-                    max_length=max_length_by_mode[mode],
-                    use_nucleus_sampling=True,
-                    num_beams=1,
-                    temperature=0.8,
-                    length_penalty=0.6,
-                    top_p=0.9,
+                    max_length=starvector_max_length,
                 )[0]
                 svg, _ = process_and_rasterize_svg(raw_svg)
+                print(
+                    "starvector_generation "
+                    f"attempt={attempt + 1} "
+                    f"raw_chars={len(raw_svg) if isinstance(raw_svg, str) else -1} "
+                    f"has_svg_close={isinstance(raw_svg, str) and '</svg>' in raw_svg.lower()} "
+                    f"postprocessed_empty={svg.strip() in {'<svg></svg>', '<svg/>', '<svg />'}}"
+                )
                 if svg.strip() not in {"<svg></svg>", "<svg/>", "<svg />"}:
                     break
         if svg.strip() in {"<svg></svg>", "<svg/>", "<svg />"}:
@@ -255,7 +258,7 @@ async def process_queued_job(input: dict) -> dict:
     uploaded = False
 
     try:
-        if job["mode"] not in max_length_by_mode:
+        if job["mode"] not in valid_modes:
             raise ValueError("invalid_mode")
         input_payload = storage_download(original_bucket, job["input_storage_path"])
         image = open_image(input_payload)
