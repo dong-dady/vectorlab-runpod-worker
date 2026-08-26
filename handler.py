@@ -32,6 +32,14 @@ async def process_queued_job(input: dict) -> dict:
         "STARVECTOR_MODEL_REVISION",
         "380ab95d25a8e9ab1dc825debe238b4953ae13b9",
     )
+    cached_model_root = os.getenv(
+        "STARVECTOR_CACHED_MODEL_ROOT",
+        "/runpod-volume/huggingface-cache/hub",
+    )
+    require_cached_model = os.getenv(
+        "STARVECTOR_REQUIRE_CACHED_MODEL",
+        "false",
+    ).strip().lower() in {"1", "true", "yes"}
     worker_name = os.getenv("VECTORLAB_WORKER_NAME", "vectorlab-runpod-serverless")
     supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
     supabase_secret_key = os.getenv("SUPABASE_SECRET_KEY", "")
@@ -112,6 +120,44 @@ async def process_queued_job(input: dict) -> dict:
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", optimize=True)
         return buffer.getvalue()
+
+    def resolve_cached_model_path() -> str | None:
+        repo_cache_name = f"models--{model_id.replace('/', '--')}"
+        repo_cache_path = os.path.join(cached_model_root, repo_cache_name)
+        snapshots_path = os.path.join(repo_cache_path, "snapshots")
+        candidates = [os.path.join(snapshots_path, model_revision)]
+
+        refs_path = os.path.join(repo_cache_path, "refs")
+        for ref_name in (model_revision, "main"):
+            ref_path = os.path.join(refs_path, ref_name)
+            try:
+                with open(ref_path, encoding="utf-8") as ref_file:
+                    ref_revision = ref_file.read().strip()
+            except OSError:
+                continue
+            if ref_revision:
+                candidates.append(os.path.join(snapshots_path, ref_revision))
+
+        try:
+            snapshot_names = sorted(os.listdir(snapshots_path))
+        except OSError:
+            snapshot_names = []
+        if len(snapshot_names) == 1:
+            candidates.append(os.path.join(snapshots_path, snapshot_names[0]))
+
+        for candidate in dict.fromkeys(candidates):
+            if not os.path.isfile(os.path.join(candidate, "config.json")):
+                continue
+            try:
+                has_weights = any(
+                    filename.endswith((".safetensors", ".bin"))
+                    for filename in os.listdir(candidate)
+                )
+            except OSError:
+                continue
+            if has_weights:
+                return candidate
+        return None
 
     def validate_svg(raw_svg: str) -> dict:
         if not isinstance(raw_svg, str):
@@ -211,11 +257,23 @@ async def process_queued_job(input: dict) -> dict:
         try:
             model = _VECTORLAB_STARVECTOR_MODEL
         except NameError:
+            cached_model_path = resolve_cached_model_path()
+            if cached_model_path:
+                model_source = cached_model_path
+                model_kwargs = {"local_files_only": True}
+                model_source_name = "runpod_cache"
+            else:
+                if require_cached_model:
+                    raise RuntimeError("cached_model_unavailable")
+                model_source = model_id
+                model_kwargs = {"revision": model_revision}
+                model_source_name = "huggingface"
+            print(f"starvector_model_load source={model_source_name}")
             model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                revision=model_revision,
+                model_source,
                 torch_dtype=torch.float16,
                 trust_remote_code=True,
+                **model_kwargs,
             )
             model.cuda()
             model.eval()
@@ -383,6 +441,7 @@ async def process_queued_job(input: dict) -> dict:
             "generation_incomplete",
             "generation_truncated",
             "generation_context_exhausted",
+            "cached_model_unavailable",
             "input_download_failed",
             "output_upload_failed",
             "job_completion_failed",
